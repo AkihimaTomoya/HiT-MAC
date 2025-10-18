@@ -45,6 +45,20 @@ def test(args, shared_model, optimizer, train_modes, n_iters):
     player.model = build_model(player.env.observation_space, player.env.action_space, args, device).to(device)
     player.model.eval()
     max_score = -100
+    
+    # ============= RESUME TEST STATE =============
+    test_state_path = os.path.join(args.log_dir, 'test_state.pth')
+    if os.path.exists(test_state_path) and args.resume_test:
+        log['{}_log'.format(args.env)].info("Resuming test from checkpoint: {}".format(test_state_path))
+        test_state = torch.load(test_state_path, map_location=device)
+        max_score = test_state.get('max_score', -100)
+        count_eps = test_state.get('count_eps', 0)
+        n_iter = test_state.get('n_iter', 0)
+        start_time = time.time() - test_state.get('elapsed_time', 0)
+        log['{}_log'.format(args.env)].info(
+            "Resumed: max_score={}, count_eps={}, n_iter={}".format(
+                max_score, count_eps, n_iter))
+    # =============================================
 
     while True:
         AG = 0
@@ -112,6 +126,16 @@ def test(args, shared_model, optimizer, train_modes, n_iters):
         state_to_save = {"model": player.model.state_dict(),
                          "optimizer": optimizer.state_dict()}
         torch.save(state_to_save, model_dir)
+        
+        # ============= SAVE TEST STATE =============
+        test_state_to_save = {
+            "max_score": max_score,
+            "count_eps": count_eps,
+            "n_iter": n_iter,
+            "elapsed_time": time.time() - start_time
+        }
+        torch.save(test_state_to_save, test_state_path)
+        # ===========================================
 
         time.sleep(args.sleep_time)
         if n_iter > args.max_step:
