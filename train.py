@@ -56,12 +56,26 @@ def train(rank, args, shared_model, optimizer, train_modes, n_iters, env=None):
     player.model = player.model.to(device)
     player.model.train()
 
+    # ============= RESUME TRAINING STATE =============
+    train_state_path = os.path.join(args.log_dir, 'train_state_rank{}.pth'.format(rank))
+    count_eps = 0
+    if os.path.exists(train_state_path) and args.resume_train:
+        print("Rank {}: Resuming training from checkpoint: {}".format(rank, train_state_path))
+        train_state = torch.load(train_state_path, map_location=device)
+        n_iter = train_state.get('n_iter', 0)
+        count_eps = train_state.get('count_eps', 0)
+        player.num_steps = train_state.get('num_steps', 0)
+        n_iters[rank] = n_iter
+        print("Rank {}: Resumed at n_iter={}, count_eps={}, num_steps={}".format(
+            rank, n_iter, count_eps, player.num_steps))
+    # =================================================
+
     player.reset()
     reward_sum = torch.zeros(player.num_agents).to(device)
     reward_sum_org = np.zeros(player.num_agents)
     ave_reward = np.zeros(2)
     ave_reward_longterm = np.zeros(2)
-    count_eps = 0
+    
     while True:
         # sys to the shared model
         player.model.load_state_dict(shared_model.state_dict())
@@ -101,6 +115,16 @@ def train(rank, args, shared_model, optimizer, train_modes, n_iters, env=None):
         # writer.add_scalar('train/lr', lr[0], n_iter)
         n_iter += 1  # s_i
         n_iters[rank] = n_iter
+        
+        # ============= SAVE TRAINING STATE (every 100 iterations) =============
+        if n_iter % 100 == 0:
+            train_state_to_save = {
+                "n_iter": n_iter,
+                "count_eps": count_eps,
+                "num_steps": player.num_steps
+            }
+            torch.save(train_state_to_save, train_state_path)
+        # ======================================================================
 
         if train_modes[rank] == -100:
             env.close()
