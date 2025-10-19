@@ -42,10 +42,20 @@ parser.add_argument('--lstm-out', type=int, default=128, metavar='LO', help='lst
 parser.add_argument('--sleep-time', type=int, default=0, metavar='LO', help='seconds')
 parser.add_argument('--max-step', type=int, default=5000000, metavar='LO', help='max learning steps')
 parser.add_argument('--render_save', dest='render_save', action='store_true', help='render save')
+# NEW: Resume arguments
+parser.add_argument('--resume-train', dest='resume_train', action='store_true', help='resume training from checkpoint')
+parser.add_argument('--resume-test', dest='resume_test', action='store_true', help='resume testing from checkpoint')
+parser.add_argument('--checkpoint-dir', default=None, metavar='CD', help='checkpoint directory to resume from')
 
 def start():
     args = parser.parse_args()
     args.shared_optimizer = True
+    
+    # Handle checkpoint directory for resume
+    if args.checkpoint_dir is not None:
+        args.log_dir = args.checkpoint_dir
+        print(f"Resuming from checkpoint directory: {args.checkpoint_dir}")
+    
     if args.gpu_ids == -1:
         torch.manual_seed(args.seed)
         args.gpu_ids = [-1]
@@ -58,20 +68,26 @@ def start():
             device_share = torch.device('cpu')
         else:
             device_share = torch.device('cuda:' + str(args.gpu_ids[-1]))
+    
     env = create_env(args.env, args)
     shared_model = build_model(env.observation_space, env.action_space, args, device_share).to(device_share)
     shared_model.share_memory()
     env.close()
     del env
 
+    # Load model checkpoint
+    checkpoint_loaded = False
     if args.load_coordinator_dir is not None:
         saved_state = torch.load(
             args.load_coordinator_dir,
             map_location=lambda storage, loc: storage)
         if args.load_coordinator_dir[-3:] == 'pth':
             shared_model.load_state_dict(saved_state['model'], strict=False)
+            checkpoint_loaded = True
+            print(f"Loaded model from: {args.load_coordinator_dir}")
         else:
             shared_model.load_state_dict(saved_state)
+            checkpoint_loaded = True
 
     params = shared_model.parameters()
     if args.shared_optimizer:
@@ -81,11 +97,27 @@ def start():
         if args.optimizer == 'Adam':
             optimizer = SharedAdam(params, lr=args.lr, amsgrad=args.amsgrad)
         optimizer.share_memory()
+        
+        # Load optimizer state if resuming training
+        if checkpoint_loaded and args.resume_train and 'optimizer' in saved_state:
+            try:
+                optimizer.load_state_dict(saved_state['optimizer'])
+                print("Loaded optimizer state from checkpoint")
+            except Exception as e:
+                print(f"Warning: Could not load optimizer state: {e}")
     else:
         optimizer = None
 
-    current_time = datetime.now().strftime('%b%d_%H-%M')
-    args.log_dir = os.path.join(args.log_dir, args.env, current_time)
+    # Create or reuse log directory
+    if args.checkpoint_dir is None:
+        current_time = datetime.now().strftime('%b%d_%H-%M')
+        args.log_dir = os.path.join(args.log_dir, args.env, current_time)
+    
+    if not os.path.exists(args.log_dir):
+        os.makedirs(args.log_dir)
+        print(f"Created log directory: {args.log_dir}")
+    else:
+        print(f"Using existing log directory: {args.log_dir}")
 
     processes = []
     manager = mp.Manager()
@@ -110,4 +142,3 @@ def start():
 
 if __name__=='__main__':
     start()
-
