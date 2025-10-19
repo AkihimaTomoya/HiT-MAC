@@ -16,7 +16,6 @@ from environment import create_env
 
 def test(args, shared_model, optimizer, train_modes, n_iters):
     ptitle('Test Agent')
-    n_iter = 0
     writer = SummaryWriter(os.path.join(args.log_dir, 'Test'))
     gpu_id = args.gpu_ids[-1]
     log = {}
@@ -38,7 +37,6 @@ def test(args, shared_model, optimizer, train_modes, n_iters):
     env = create_env(args.env, args)
     env.seed(args.seed)
     start_time = time.time()
-    count_eps = 0
 
     player = Agent(None, env, args, None, device)
     player.gpu_id = gpu_id
@@ -48,23 +46,41 @@ def test(args, shared_model, optimizer, train_modes, n_iters):
     
     # ============= RESUME TEST STATE =============
     test_state_path = os.path.join(args.log_dir, 'test_state.pth')
+    count_eps = 0
+    total_steps = 0  # Track total test steps/iterations
+    
     if os.path.exists(test_state_path) and args.resume_test:
         log['{}_log'.format(args.env)].info("Resuming test from checkpoint: {}".format(test_state_path))
         test_state = torch.load(test_state_path, map_location=device)
         max_score = test_state.get('max_score', -100)
         count_eps = test_state.get('count_eps', 0)
-        n_iter = test_state.get('n_iter', 0)
+        total_steps = test_state.get('total_steps', 0)
         start_time = time.time() - test_state.get('elapsed_time', 0)
         log['{}_log'.format(args.env)].info(
-            "Resumed: max_score={}, count_eps={}, n_iter={}".format(
-                max_score, count_eps, n_iter))
+            "Resumed: max_score={}, count_eps={}, total_steps={}".format(
+                max_score, count_eps, total_steps))
     # =============================================
 
+    # Checkpoint frequency
+    save_frequency = 1000  # Save every 1000 steps
+    last_save_step = total_steps
+
     while True:
+        # Check if reached max_step
+        if total_steps >= args.max_step:
+            log['{}_log'.format(args.env)].info(
+                "Reached max steps: {}/{}".format(total_steps, args.max_step))
+            env.close()
+            if args.workers > 0:
+                for id in range(0, args.workers):
+                    train_modes[id] = -100
+            break
+
         AG = 0
         reward_sum = np.zeros(player.num_agents)
         reward_sum_list = []
         len_sum = 0
+        
         for i_episode in range(args.test_eps):
             player.model.load_state_dict(shared_model.state_dict())
             player.reset()
@@ -75,30 +91,36 @@ def test(args, shared_model, optimizer, train_modes, n_iters):
             t0 = time.time()
             count_eps += 1
             fps_all = []
+            
             while True:
                 player.action_test()
                 fps_counter += 1
+                total_steps += 1  # Increment total steps
                 reward_sum_ep += player.reward
                 rotation_sum_ep += player.rotation
+                
                 if player.done:
                     AG += reward_sum_ep[0]/rotation_sum_ep*player.num_agents
                     reward_sum += reward_sum_ep
                     reward_sum_list.append(reward_sum_ep[0])
                     len_sum += player.eps_len
                     fps = fps_counter / (time.time()-t0)
+                    
+                    # Get n_iter from training workers (if any)
                     n_iter = 0
                     for n in n_iters:
                         n_iter += n
 
                     for i, r_i in enumerate(reward_sum_ep):
-                        writer.add_scalar('test/reward'+str(i), r_i, n_iter)
+                        writer.add_scalar('test/reward'+str(i), r_i, total_steps)
 
                     fps_all.append(fps)
-                    writer.add_scalar('test/fps', fps, n_iter)
-                    writer.add_scalar('test/eps_len', player.eps_len, n_iter)
+                    writer.add_scalar('test/fps', fps, total_steps)
+                    writer.add_scalar('test/eps_len', player.eps_len, total_steps)
+                    writer.add_scalar('test/total_steps', total_steps, total_steps)
                     break
 
-        # player.max_length:
+        # Calculate metrics
         ave_AG = AG/args.test_eps
         ave_reward_sum = reward_sum/args.test_eps
         len_mean = len_sum/args.test_eps
@@ -107,39 +129,47 @@ def test(args, shared_model, optimizer, train_modes, n_iters):
         std_reward = np.std(reward_sum_list)
 
         log['{}_log'.format(args.env)].info(
-            "Time {0}, ave eps reward {1}, ave eps length {2}, reward step {3}, FPS {4}, "
-            "mean reward {5}, std reward {6}, AG {7}".
+            "Steps {0}/{1}, Time {2}, ave eps reward {3}, ave eps length {4}, reward step {5}, FPS {6}, "
+            "mean reward {7}, std reward {8}, AG {9}".
             format(
+                total_steps, args.max_step,
                 time.strftime("%Hh %Mm %Ss", time.gmtime(time.time() - start_time)),
                 np.around(ave_reward_sum, decimals=2), np.around(len_mean, decimals=2),
                 np.around(reward_step, decimals=2), np.around(np.mean(fps_all), decimals=2),
                 mean_reward, std_reward, np.around(ave_AG, decimals=2)
             ))
 
-        # save model
+        # Save best model
         if ave_reward_sum[0] >= max_score:
-            print('save best!')
+            print('save best! (score: {} -> {})'.format(max_score, ave_reward_sum[0]))
             max_score = ave_reward_sum[0]
             model_dir = os.path.join(args.log_dir, 'best.pth')
-        else:
-            model_dir = os.path.join(args.log_dir, 'new.pth'.format(args.env))
+            state_to_save = {"model": player.model.state_dict(),
+                             "optimizer": optimizer.state_dict() if optimizer else None,
+                             "max_score": max_score,
+                             "total_steps": total_steps}
+            torch.save(state_to_save, model_dir)
+        
+        # Always save latest model
+        model_dir = os.path.join(args.log_dir, 'new.pth')
         state_to_save = {"model": player.model.state_dict(),
-                         "optimizer": optimizer.state_dict()}
+                         "optimizer": optimizer.state_dict() if optimizer else None,
+                         "total_steps": total_steps}
         torch.save(state_to_save, model_dir)
         
-        # ============= SAVE TEST STATE =============
-        test_state_to_save = {
-            "max_score": max_score,
-            "count_eps": count_eps,
-            "n_iter": n_iter,
-            "elapsed_time": time.time() - start_time
-        }
-        torch.save(test_state_to_save, test_state_path)
-        # ===========================================
+        # ============= SAVE TEST STATE FREQUENTLY =============
+        # Save every save_frequency steps OR at the end of test_eps batch
+        if total_steps - last_save_step >= save_frequency or total_steps >= args.max_step:
+            test_state_to_save = {
+                "max_score": max_score,
+                "count_eps": count_eps,
+                "total_steps": total_steps,
+                "elapsed_time": time.time() - start_time
+            }
+            torch.save(test_state_to_save, test_state_path)
+            last_save_step = total_steps
+            log['{}_log'.format(args.env)].info(
+                "Checkpoint saved at step {}".format(total_steps))
+        # =====================================================
 
         time.sleep(args.sleep_time)
-        if n_iter > args.max_step:
-            env.close()
-            for id in range(0, args.workers):
-                train_modes[id] = -100
-            break
