@@ -46,6 +46,7 @@ parser.add_argument('--render_save', dest='render_save', action='store_true', he
 parser.add_argument('--resume-train', dest='resume_train', action='store_true', help='resume training from checkpoint')
 parser.add_argument('--resume-test', dest='resume_test', action='store_true', help='resume testing from checkpoint')
 parser.add_argument('--checkpoint-dir', default=None, metavar='CD', help='checkpoint directory to resume from')
+parser.add_argument('--save-freq', type=int, default=1000, metavar='SF', help='save checkpoint every N steps (default: 1000)')
 
 def start():
     args = parser.parse_args()
