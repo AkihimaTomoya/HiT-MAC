@@ -117,6 +117,14 @@ def test(args, shared_model, optimizer, train_modes, n_iters):
                     fps_all.append(fps)
                     writer.add_scalar('test/fps', fps, total_steps)
                     writer.add_scalar('test/eps_len', player.eps_len, total_steps)
+                    
+                    if hasattr(player.env, 'Camera_target_dict'):
+                        info_last = player.info
+                        if 'Coverage_rate' in info_last:
+                            writer.add_scalar('test/coverage_rate', info_last['Coverage_rate'], total_steps)
+                            log['{}_log'.format(args.env)].info("Coverage Rate: {:.2f}%".format(
+                                info_last['Coverage_rate'] * 100))
+                    
                     writer.add_scalar('test/total_steps', total_steps, total_steps)
                     break
 
