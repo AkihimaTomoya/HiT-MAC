@@ -50,16 +50,26 @@ class Agent(object):
 
     def action_train(self):
         self.n_steps += 1
-        value_multi, actions, entropy, log_prob = self.model(Variable(self.state, requires_grad=True))
+        # CHANGED: Use non_blocking transfer for better performance
+        value_multi, actions, entropy, log_prob = self.model(
+            Variable(self.state, requires_grad=True)
+        )
 
         state_multi, reward_multi, self.done, self.info = self.env.step(actions)
-        if isinstance(self.done, list): self.done = np.sum(self.done)
-        self.state = torch.from_numpy(np.array(state_multi)).float().to(self.device)
+        if isinstance(self.done, list): 
+            self.done = np.sum(self.done)
+        
+        # CHANGED: Convert to tensor on GPU efficiently
+        self.state = torch.from_numpy(np.array(state_multi)).float().to(self.device, non_blocking=True)
         self.reward_org = reward_multi.copy()
+        
         if self.args.norm_reward:
             reward_multi = self.reward_normalizer(reward_multi)
-        self.reward = torch.tensor(reward_multi).float().to(self.device)
+        
+        # CHANGED: Direct conversion to GPU tensor
+        self.reward = torch.tensor(reward_multi, dtype=torch.float32, device=self.device)
         self.eps_len += 1
+        
         self.values.append(value_multi)
         self.entropies.append(entropy)
         self.log_probs.append(log_prob)
@@ -70,15 +80,20 @@ class Agent(object):
             value_multi, actions, entropy, log_prob = self.model(Variable(self.state), True)
 
         state_multi, self.reward, self.done, self.info = self.env.step(actions)
-        if isinstance(self.done, list): self.done = np.sum(self.done)
-        self.state = torch.from_numpy(np.array(state_multi)).float().to(self.device)
+        if isinstance(self.done, list): 
+            self.done = np.sum(self.done)
+        
+        # CHANGED: Use non_blocking transfer
+        self.state = torch.from_numpy(np.array(state_multi)).float().to(self.device, non_blocking=True)
+        
         if self.env.reset_type == 1:
             self.rotation = self.info['cost']
         self.eps_len += 1
 
     def reset(self):
         obs = self.env.reset()
-        self.state = torch.from_numpy(np.array(obs)).float().to(self.device)
+        # CHANGED: Use non_blocking transfer
+        self.state = torch.from_numpy(np.array(obs)).float().to(self.device, non_blocking=True)
 
         self.eps_len = 0
         self.eps_num += 1
@@ -86,15 +101,12 @@ class Agent(object):
         self.model.sample_noise()
 
     def clean_buffer(self, done):
-        # outputs
         self.values = []
         self.log_probs = []
         self.entropies = []
-        # gt
         self.rewards = []
         self.obs_tracker = []
         if done:
-            # clean
             self.rewards_eps = []
 
         return self
@@ -123,37 +135,39 @@ class Agent(object):
         self.hxs = Variable(self.hxs.data)
 
     def optimize(self, params, optimizer, shared_model, training_mode, device_share):
-        R = torch.zeros(len(self.rewards[0]), 1).to(self.device)
+        # CHANGED: Initialize tensors directly on GPU
+        R = torch.zeros(len(self.rewards[0]), 1, device=self.device)
+        
         if not self.done:
-            # predict value
             state = self.state
             value_multi, *others = self.model(Variable(state, requires_grad=True))
-            for i in range(len(self.rewards[0])):  # num_agent
+            for i in range(len(self.rewards[0])):
                 R[i][0] = value_multi[i].data
 
         self.values.append(Variable(R).to(self.device))
 
         batch_size = len(self.entropies[0][0])
-        policy_loss = torch.zeros(batch_size, 1).to(self.device)
-        value_loss = torch.zeros(1, 1).to(self.device)
-        entropies = torch.zeros(batch_size, self.dim_action).to(self.device)
+        # CHANGED: Initialize on GPU
+        policy_loss = torch.zeros(batch_size, 1, device=self.device)
+        value_loss = torch.zeros(1, 1, device=self.device)
+        entropies = torch.zeros(batch_size, self.dim_action, device=self.device)
         w_entropies = float(self.args.entropy)
 
         R = Variable(R, requires_grad=True).to(self.device)
-        gae = torch.zeros(1, 1).to(self.device)
+        gae = torch.zeros(1, 1, device=self.device)
 
         for i in reversed(range(len(self.rewards))):
             R = self.args.gamma * R + self.rewards[i]
             advantage = R - self.values[i]
             value_loss = value_loss + 0.5 * advantage.pow(2)
-            # Generalized Advantage Estimataion
+            
             delta_t = self.rewards[i] + self.args.gamma * self.values[i + 1].data - self.values[i].data
             gae = gae * self.args.gamma * self.args.tau + delta_t
+            
             policy_loss = policy_loss - \
                 (self.log_probs[i] * Variable(gae)) - \
                 (w_entropies * self.entropies[i])
             entropies += self.entropies[i].sum()
-
 
         self.model.zero_grad()
         loss = policy_loss.sum() + 0.5 * value_loss.sum()
@@ -165,4 +179,3 @@ class Agent(object):
         self.clean_buffer(self.done)
 
         return policy_loss, value_loss, entropies
-
