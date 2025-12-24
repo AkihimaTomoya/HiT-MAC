@@ -31,7 +31,8 @@ parser.add_argument('--load-coordinator-dir', default=None, metavar='LMD', help=
 parser.add_argument('--load-executor-dir', default=None, metavar='LMD', help='folder to load trained models from')
 parser.add_argument('--log-dir', default='logs/', metavar='LG', help='folder to save logs')
 parser.add_argument('--model', default='single', metavar='M', help='multi-shapleyV|')
-parser.add_argument('--gpu-ids', type=int, default=-1, nargs='+', help='GPUs to use [-1 CPU only] (default: -1)')
+# CHANGED: Default to use GPU 0 if available
+parser.add_argument('--gpu-ids', type=int, default=None, nargs='+', help='GPUs to use [-1 CPU only] (default: auto-detect)')
 parser.add_argument('--norm-reward', dest='norm_reward', action='store_true', help='normalize image')
 parser.add_argument('--render', dest='render', action='store_true', help='render test')
 parser.add_argument('--fix', dest='fix', action='store_true', help='fix random seed')
@@ -42,7 +43,6 @@ parser.add_argument('--lstm-out', type=int, default=128, metavar='LO', help='lst
 parser.add_argument('--sleep-time', type=int, default=0, metavar='LO', help='seconds')
 parser.add_argument('--max-step', type=int, default=5000000, metavar='LO', help='max learning steps')
 parser.add_argument('--render_save', dest='render_save', action='store_true', help='render save')
-# NEW: Resume arguments
 parser.add_argument('--resume-train', dest='resume_train', action='store_true', help='resume training from checkpoint')
 parser.add_argument('--resume-test', dest='resume_test', action='store_true', help='resume testing from checkpoint')
 parser.add_argument('--checkpoint-dir', default=None, metavar='CD', help='checkpoint directory to resume from')
@@ -57,18 +57,33 @@ def start():
         args.log_dir = args.checkpoint_dir
         print(f"Resuming from checkpoint directory: {args.checkpoint_dir}")
     
-    if args.gpu_ids == -1:
+    # NEW: Auto-detect GPU if not specified
+    if args.gpu_ids is None:
+        if torch.cuda.is_available():
+            args.gpu_ids = [0]  # Use first GPU by default
+            print(f"GPU detected! Using GPU: {args.gpu_ids}")
+        else:
+            args.gpu_ids = [-1]
+            print("No GPU detected. Using CPU.")
+    
+    if args.gpu_ids == -1 or (isinstance(args.gpu_ids, list) and args.gpu_ids[0] == -1):
         torch.manual_seed(args.seed)
         args.gpu_ids = [-1]
         device_share = torch.device('cpu')
         mp.set_start_method('spawn')
+        print("Running on CPU")
     else:
         torch.cuda.manual_seed(args.seed)
         mp.set_start_method('spawn', force=True)
         if len(args.gpu_ids) > 1:
             device_share = torch.device('cpu')
+            print(f"Multi-GPU training with {len(args.gpu_ids)} GPUs: {args.gpu_ids}")
         else:
             device_share = torch.device('cuda:' + str(args.gpu_ids[-1]))
+            print(f"Single-GPU training on GPU {args.gpu_ids[0]}")
+        
+        # NEW: Set default GPU for CUDA operations
+        torch.cuda.set_device(args.gpu_ids[0])
     
     env = create_env(args.env, args)
     shared_model = build_model(env.observation_space, env.action_space, args, device_share).to(device_share)
@@ -81,7 +96,7 @@ def start():
     if args.load_coordinator_dir is not None:
         saved_state = torch.load(
             args.load_coordinator_dir,
-            map_location=lambda storage, loc: storage)
+            map_location=device_share)  # CHANGED: Load directly to device_share
         if args.load_coordinator_dir[-3:] == 'pth':
             shared_model.load_state_dict(saved_state['model'], strict=False)
             checkpoint_loaded = True
@@ -99,7 +114,6 @@ def start():
             optimizer = SharedAdam(params, lr=args.lr, amsgrad=args.amsgrad)
         optimizer.share_memory()
         
-        # Load optimizer state if resuming training
         if checkpoint_loaded and args.resume_train and 'optimizer' in saved_state:
             try:
                 optimizer.load_state_dict(saved_state['optimizer'])
@@ -125,11 +139,13 @@ def start():
     train_modes = manager.list()
     n_iters = manager.list()
 
+    # Test process
     p = mp.Process(target=test, args=(args, shared_model, optimizer, train_modes, n_iters))
     p.start()
     processes.append(p)
     time.sleep(args.sleep_time)
 
+    # Training processes
     for rank in range(0, args.workers):
         p = mp.Process(target=train, args=(rank, args, shared_model, optimizer, train_modes, n_iters))
         p.start()
